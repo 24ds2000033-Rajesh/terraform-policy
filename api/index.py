@@ -3,17 +3,14 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Assigned production workspace
 WORKSPACE = "prod-t0mczs"
 
-# Required cost-ownership labels
 REQUIRED_LABELS = {
     "owner": "student-g2mgc",
     "environment": "production",
     "cost_center": "cc-aftn",
 }
 
-# Allowed Terraform remote-state backends
 ALLOWED_BACKENDS = {
     "gcs",
     "s3",
@@ -21,7 +18,12 @@ ALLOWED_BACKENDS = {
     "remote",
 }
 
-# Resource types for which deletion requires approval
+ALLOWED_ACTIONS = {
+    "create",
+    "update",
+    "delete",
+}
+
 DESTRUCTIVE_TYPES = {
     "storage_bucket",
     "sql_database",
@@ -29,24 +31,22 @@ DESTRUCTIVE_TYPES = {
 }
 
 
-def reject(reason: str):
+def response(decision, reason):
     return JSONResponse(
         status_code=200,
         content={
-            "decision": "reject",
+            "decision": decision,
             "reason": reason,
         },
     )
 
 
+def reject(reason):
+    return response("reject", reason)
+
+
 def approve():
-    return JSONResponse(
-        status_code=200,
-        content={
-            "decision": "approve",
-            "reason": "APPROVE",
-        },
-    )
+    return response("approve", "APPROVE")
 
 
 def is_string(value):
@@ -61,9 +61,10 @@ def is_bool(value):
 async def terraform_plan(request: Request):
 
     # =========================================================
-    # RULE 1: Request and nested objects must have shown types
+    # 1. SCHEMA / TYPE VALIDATION
     # =========================================================
 
+    # Valid JSON object required.
     try:
         body = await request.json()
     except Exception:
@@ -72,68 +73,112 @@ async def terraform_plan(request: Request):
     if type(body) is not dict:
         return reject("INVALID_PLAN")
 
-    # Top-level types
-    if not is_string(body.get("environment")):
+    # Required top-level fields.
+    required_top_level = {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource",
+    }
+
+    if not required_top_level.issubset(body.keys()):
         return reject("INVALID_PLAN")
 
-    if type(body.get("state")) is not dict:
+    # Top-level types.
+    if not is_string(body["environment"]):
         return reject("INVALID_PLAN")
 
-    if not is_string(body.get("providerVersion")):
+    if type(body["state"]) is not dict:
         return reject("INVALID_PLAN")
 
-    if not is_bool(body.get("destroyApproved")):
+    if not is_string(body["providerVersion"]):
         return reject("INVALID_PLAN")
 
-    if type(body.get("resource")) is not dict:
+    if not is_bool(body["destroyApproved"]):
+        return reject("INVALID_PLAN")
+
+    if type(body["resource"]) is not dict:
         return reject("INVALID_PLAN")
 
     state = body["state"]
     resource = body["resource"]
 
-    # State types
-    if not is_string(state.get("backend")):
+    # ---------------------------------------------------------
+    # State schema
+    # ---------------------------------------------------------
+
+    required_state = {
+        "backend",
+        "locked",
+    }
+
+    if not required_state.issubset(state.keys()):
         return reject("INVALID_PLAN")
 
-    if not is_bool(state.get("locked")):
+    if not is_string(state["backend"]):
         return reject("INVALID_PLAN")
 
-    # Resource types
-    if not is_string(resource.get("address")):
+    if not is_bool(state["locked"]):
         return reject("INVALID_PLAN")
 
-    if not is_string(resource.get("type")):
+    # ---------------------------------------------------------
+    # Resource schema
+    # ---------------------------------------------------------
+
+    required_resource = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy",
+    }
+
+    if not required_resource.issubset(resource.keys()):
         return reject("INVALID_PLAN")
 
-    if not is_string(resource.get("action")):
+    if not is_string(resource["address"]):
         return reject("INVALID_PLAN")
 
-    if type(resource.get("labels")) is not dict:
+    if not is_string(resource["type"]):
         return reject("INVALID_PLAN")
 
-    if not is_bool(resource.get("forceDestroy")):
+    if not is_string(resource["action"]):
         return reject("INVALID_PLAN")
 
-    # secret may be null or string
-    secret = resource.get("secret")
+    if resource["action"] not in ALLOWED_ACTIONS:
+        return reject("INVALID_PLAN")
+
+    if type(resource["labels"]) is not dict:
+        return reject("INVALID_PLAN")
+
+    if not is_bool(resource["forceDestroy"]):
+        return reject("INVALID_PLAN")
+
+    # secret must be either null or a string.
+    secret = resource["secret"]
 
     if secret is not None and not is_string(secret):
         return reject("INVALID_PLAN")
 
-    # Label keys and values must be strings
+    # Label keys and values must be strings.
     for key, value in resource["labels"].items():
-        if not is_string(key) or not is_string(value):
+        if not is_string(key):
+            return reject("INVALID_PLAN")
+
+        if not is_string(value):
             return reject("INVALID_PLAN")
 
     # =========================================================
-    # RULE 2: Environment must exactly match workspace
+    # 2. ENVIRONMENT
     # =========================================================
 
     if body["environment"] != WORKSPACE:
         return reject("ENVIRONMENT_MISMATCH")
 
     # =========================================================
-    # RULE 3: State must be a supported backend and locked
+    # 3. STATE SAFETY
     # =========================================================
 
     if state["backend"] not in ALLOWED_BACKENDS:
@@ -143,17 +188,7 @@ async def terraform_plan(request: Request):
         return reject("STATE_UNSAFE")
 
     # =========================================================
-    # RULE 4: Provider must be pinned
-    #
-    # Accepted:
-    #   6.2.1
-    #   = 6.2.1
-    #   ~> 6.0
-    #
-    # Rejected:
-    #   >= 6.0
-    #   *
-    #   latest
+    # 4. PROVIDER PINNING
     # =========================================================
 
     provider = body["providerVersion"]
@@ -166,7 +201,7 @@ async def terraform_plan(request: Request):
         return reject("UNPINNED_PROVIDER")
 
     # =========================================================
-    # RULE 5: Required labels must have exact values
+    # 5. REQUIRED LABELS
     # =========================================================
 
     labels = resource["labels"]
@@ -176,20 +211,21 @@ async def terraform_plan(request: Request):
             return reject("MISSING_LABELS")
 
     # =========================================================
-    # RULE 6: Secret must be null or non-empty secret:// reference
+    # 6. SECRET PROTECTION
     # =========================================================
 
     if secret is not None:
 
+        # Must begin with secret://
         if not secret.startswith("secret://"):
             return reject("PLAINTEXT_SECRET")
 
-        # "secret://" alone is not a valid non-empty reference
-        if len(secret) <= len("secret://"):
+        # secret:// alone is not a valid non-empty reference.
+        if len(secret) == len("secret://"):
             return reject("PLAINTEXT_SECRET")
 
     # =========================================================
-    # RULE 7: Destructive deletes require approval
+    # 7. DELETE APPROVAL
     # =========================================================
 
     if (
@@ -200,7 +236,7 @@ async def terraform_plan(request: Request):
             return reject("DELETE_NOT_APPROVED")
 
     # =========================================================
-    # RULE 8: Production storage bucket cannot force destroy
+    # 8. FORCE DESTROY
     # =========================================================
 
     if (
@@ -211,7 +247,7 @@ async def terraform_plan(request: Request):
         return reject("FORCE_DESTROY")
 
     # =========================================================
-    # ALL CHECKS PASSED
+    # APPROVED
     # =========================================================
 
     return approve()
