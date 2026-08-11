@@ -1,7 +1,5 @@
-```python
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import uvicorn
 import os
 
 app = FastAPI()
@@ -15,224 +13,186 @@ REQUIRED_LABELS = {
 }
 
 ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
-ALLOWED_ACTIONS = {"create", "update", "delete"}
-DESTRUCTIVE_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
+DESTRUCTIVE_TYPES = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk",
+}
 
 
-def result(decision: str, reason: str):
-    return {"decision": decision, "reason": reason}
+def reject(reason: str):
+    return JSONResponse(
+        status_code=200,
+        content={
+            "decision": "reject",
+            "reason": reason,
+        },
+    )
 
 
-def is_bool(value):
-    # bool must be an actual JSON boolean, not 0/1 or a string.
-    return type(value) is bool
+def approve():
+    return JSONResponse(
+        status_code=200,
+        content={
+            "decision": "approve",
+            "reason": "APPROVE",
+        },
+    )
 
 
 def is_string(value):
     return type(value) is str
 
 
+def is_bool(value):
+    return type(value) is bool
+
+
 @app.post("/terraform/plan")
 async def terraform_plan(request: Request):
-    # JSON/body/type validation
+
+    # ---------------------------------------------------------
+    # 1. Request and nested object type validation
+    # ---------------------------------------------------------
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if type(body) is not dict:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
-    # Top-level fields must have the required types.
     if not is_string(body.get("environment")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if type(body.get("state")) is not dict:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_string(body.get("providerVersion")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_bool(body.get("destroyApproved")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
-    resource = body.get("resource")
-    if type(resource) is not dict:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+    if type(body.get("resource")) is not dict:
+        return reject("INVALID_PLAN")
+
+    state = body["state"]
+    resource = body["resource"]
 
     # State types
-    state = body["state"]
-
     if not is_string(state.get("backend")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_bool(state.get("locked")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     # Resource types
     if not is_string(resource.get("address")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_string(resource.get("type")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_string(resource.get("action")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if type(resource.get("labels")) is not dict:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
-
-    # secret is null or string
-    secret = resource.get("secret")
-    if secret is not None and not is_string(secret):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
     if not is_bool(resource.get("forceDestroy")):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "INVALID_PLAN")
-        )
+        return reject("INVALID_PLAN")
 
-    # Every label value must be a string.
+    secret = resource.get("secret")
+
+    if secret is not None and not is_string(secret):
+        return reject("INVALID_PLAN")
+
+    # Every label key/value must be a string.
     for key, value in resource["labels"].items():
         if not is_string(key) or not is_string(value):
-            return JSONResponse(
-                status_code=200,
-                content=result("reject", "INVALID_PLAN")
-            )
+            return reject("INVALID_PLAN")
 
     # ---------------------------------------------------------
-    # POLICY RULES — MUST STAY IN THIS ORDER
+    # 2. Environment must exactly match assigned workspace
     # ---------------------------------------------------------
-
-    # 1. Environment
     if body["environment"] != WORKSPACE:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "ENVIRONMENT_MISMATCH")
-        )
+        return reject("ENVIRONMENT_MISMATCH")
 
-    # 2. State safety
-    if (
-        state["backend"] not in ALLOWED_BACKENDS
-        or state["locked"] is not True
-    ):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "STATE_UNSAFE")
-        )
+    # ---------------------------------------------------------
+    # 3. Remote state must use an approved backend and be locked
+    # ---------------------------------------------------------
+    if state["backend"] not in ALLOWED_BACKENDS:
+        return reject("STATE_UNSAFE")
 
-    # 3. Provider pinning
+    if state["locked"] is not True:
+        return reject("STATE_UNSAFE")
+
+    # ---------------------------------------------------------
+    # 4. Provider must be pinned
+    #
+    # Accepted:
+    #   6.2.1
+    #   = 6.2.1
+    #   ~> 6.0
+    #
+    # Rejected:
+    #   >= 6.0
+    #   *
+    #   latest
+    # ---------------------------------------------------------
     provider = body["providerVersion"]
 
-    provider_ok = (
-        provider in {"6.2.1", "= 6.2.1"}
-        or provider == "~> 6.0"
-    )
+    if provider not in {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0",
+    }:
+        return reject("UNPINNED_PROVIDER")
 
-    if not provider_ok:
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "UNPINNED_PROVIDER")
-        )
-
-    # 4. Required labels
+    # ---------------------------------------------------------
+    # 5. Required labels must have exact values
+    # ---------------------------------------------------------
     labels = resource["labels"]
 
     for key, expected_value in REQUIRED_LABELS.items():
         if labels.get(key) != expected_value:
-            return JSONResponse(
-                status_code=200,
-                content=result("reject", "MISSING_LABELS")
-            )
+            return reject("MISSING_LABELS")
 
-    # 5. Secret handling
-    #
-    # Valid:
-    #   null
-    #   secret://anything-non-empty
-    #
-    # Invalid:
-    #   ""
-    #   "password"
-    #   "my-secret"
-    #   "plaintext..."
+    # ---------------------------------------------------------
+    # 6. Secret must be null or a non-empty secret:// reference
+    # ---------------------------------------------------------
     if secret is not None:
-        if not secret.startswith("secret://") or len(secret) <= len("secret://"):
-            return JSONResponse(
-                status_code=200,
-                content=result("reject", "PLAINTEXT_SECRET")
-            )
+        if not secret.startswith("secret://"):
+            return reject("PLAINTEXT_SECRET")
 
-    # 6. Destructive delete approval
+        if len(secret) <= len("secret://"):
+            return reject("PLAINTEXT_SECRET")
+
+    # ---------------------------------------------------------
+    # 7. Destructive deletes require explicit approval
+    # ---------------------------------------------------------
     if (
         resource["action"] == "delete"
         and resource["type"] in DESTRUCTIVE_TYPES
-        and body["destroyApproved"] is not True
     ):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "DELETE_NOT_APPROVED")
-        )
+        if body["destroyApproved"] is not True:
+            return reject("DELETE_NOT_APPROVED")
 
-    # 7. Production storage bucket force-destroy
+    # ---------------------------------------------------------
+    # 8. Production storage buckets may never force destroy
+    # ---------------------------------------------------------
     if (
         resource["type"] == "storage_bucket"
         and labels.get("environment") == "production"
         and resource["forceDestroy"] is True
     ):
-        return JSONResponse(
-            status_code=200,
-            content=result("reject", "FORCE_DESTROY")
-        )
+        return reject("FORCE_DESTROY")
 
-    # Everything passed.
-    return JSONResponse(
-        status_code=200,
-        content=result("approve", "APPROVE")
-    )
+    # ---------------------------------------------------------
+    # All policy checks passed
+    # ---------------------------------------------------------
+    return approve()
 
 
 @app.get("/")
@@ -246,6 +206,12 @@ async def health():
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
-```
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+    )
